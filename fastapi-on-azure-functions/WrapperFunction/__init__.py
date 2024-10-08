@@ -1,6 +1,7 @@
 # main.py
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException
 import uuid
+from datetime import datetime, timedelta
 from typing import List, Optional
 from datetime import datetime
 from fastapi.encoders import jsonable_encoder
@@ -17,6 +18,9 @@ from models import (
 from database import get_lost_item_container, get_lost_item_by_subcategory_container
 from chat_service import ChatService
 import logging
+from azure.storage.blob import BlobServiceClient
+from azure.identity import DefaultAzureCredential
+import os
 
 # ロギングの設定
 logging.basicConfig(level=logging.INFO)
@@ -24,18 +28,25 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
+chat_service = ChatService()
+
 # Cosmos DB のコンテナ取得
 lost_items_container = get_lost_item_container()  # LostItems コンテナ
 lost_items_by_subcategory_container = get_lost_item_by_subcategory_container()  # LostItemBySubcategory コンテナ
 
+# 環境変数から設定を取得
+BLOB_CONTAINER_NAME = "images"  # コンテナ名
+BLOB_ACCOUNT_URL = os.getenv("AZURE_BLOB_ACCOUNT_URL")  # ストレージアカウントのURL
+
 @app.get("/lostitems", response_model=List[LostItem])
-async def get_lost_items(municipality: Optional[str] = None, categoryName: Optional[str] = None):
+async def get_lost_items(municipality: Optional[str] = None, categoryName: Optional[str] = None, color: Optional[str] = None, findDate: Optional[str] = None):
     """
     Cosmos DB から忘れ物データをクエリし、結果を返す
     - `municipality`: 市区町村でフィルタリング
     - `categoryName`: 中分類でフィルタリング
+    - `color`: 色でフィルタリング
+    - `findDate`: 指定日数以内でフィルタリング
     """
-    chat_service = ChatService()
     query = "SELECT * FROM c"
     filters = []
 
@@ -46,6 +57,24 @@ async def get_lost_items(municipality: Optional[str] = None, categoryName: Optio
     if categoryName:
         categoryName = chat_service.select_category(categoryName)
         filters.append(f"c.item.categoryName = '{categoryName}'")
+
+    if color:
+        filters.append(f"c.color.id = '{color}'")
+
+    # 日付フィルタ
+    if findDate:
+        today = datetime.utcnow()
+        if findDate == 'today':
+            filters.append(f"c.findDateTime >= '{today.strftime('%Y-%m-%dT%H:%M:%S')}'")
+        elif findDate == 'yesterday':
+            yesterday = today - timedelta(days=1)
+            filters.append(f"c.findDateTime >= '{yesterday.strftime('%Y-%m-%dT%H:%M:%S')}'")
+        elif findDate == 'last_week':
+            last_week = today - timedelta(weeks=1)
+            filters.append(f"c.findDateTime >= '{last_week.strftime('%Y-%m-%dT%H:%M:%S')}'")
+        elif findDate == 'last_month':
+            last_month = today - timedelta(weeks=4)  # 1ヶ月を4週間とする
+            filters.append(f"c.findDateTime >= '{last_month.strftime('%Y-%m-%dT%H:%M:%S')}'")
 
     if filters:
         query += " WHERE " + " AND ".join(filters)
@@ -71,38 +100,7 @@ async def get_lost_items(municipality: Optional[str] = None, categoryName: Optio
     except Exception as e:
         logger.error(f"Failed to convert data to Pydantic models: {e}")
         raise HTTPException(status_code=500, detail=f"データの変換に失敗しました: {str(e)}")
-
-@app.get("/lostitems/subcategory", response_model=List[LostItemBySubcategory])
-async def get_lost_items_by_subcategory(subcategory: str):
-    """
-    Cosmos DB の LostItemBySubcategory コンテナから、中分類ごとの忘れ物データをクエリし、結果を返す
-    """
-    chat_service = ChatService()
-    subcategory = chat_service.select_category(subcategory)
-    query = f"SELECT * FROM c WHERE c.item.categoryName = '{subcategory}'"
-
-    logger.info(f"Executing query: {query}")
-
-    try:
-        items = list(lost_items_by_subcategory_container.query_items(
-            query=query,
-            enable_cross_partition_query=True
-        ))
-        logger.info(f"Retrieved {len(items)} items for subcategory '{subcategory}'")
-    except Exception as e:
-        logger.error(f"Failed to execute query: {e}")
-        raise HTTPException(status_code=500, detail=f"データの取得に失敗しました: {str(e)}")
-
-    if not items:
-        raise HTTPException(status_code=404, detail=f"Lost items with subcategory '{subcategory}' not found")
-
-    # Pydanticモデルに変換
-    try:
-        return [LostItemBySubcategory(**item) for item in items]
-    except Exception as e:
-        logger.error(f"Failed to convert data to Pydantic models: {e}")
-        raise HTTPException(status_code=500, detail=f"データの変換に失敗しました: {str(e)}")
-
+    
 @app.post("/lostitems", response_model=LostItem)
 async def add_lost_item(item: LostItemRequest):
     """
@@ -133,38 +131,73 @@ async def add_lost_item(item: LostItemRequest):
         logger.error(f"Failed to add lost item: {e}")
         raise HTTPException(status_code=500, detail=f"アイテムの追加に失敗しました: {str(e)}")
 
-@app.put("/lostitems/{item_id}", response_model=LostItem)
-async def update_lost_item(item_id: str, item: LostItemRequest):
+@app.delete("/lostitems/{id}", response_model=LostItem)
+async def delete_lost_item(id: str):
     """
-    既存の忘れ物データを更新する
+    指定されたIDを持つ忘れ物データを削除する
+    :param id: 削除する忘れ物データのID
+    :return: 削除された忘れ物データ
     """
+    query = f"SELECT * FROM c WHERE c.id = '{id}'"
+    logger.info(f"Executing query: {query}")
+
     try:
-        logger.info(f"Updating lost item with ID: {item_id} with data: {item}")
+        items = list(lost_items_container.query_items(
+            query=query,
+            enable_cross_partition_query=True
+        ))
+        if not items:
+            raise HTTPException(status_code=404, detail="アイテムが見つかりません")
 
-        # 既存のアイテムを取得
-        existing_item = lost_items_container.read_item(item=item_id, partition_key=item.createUserPlace)
-        logger.info(f"Retrieved existing item: {existing_item}")
+        item_to_delete = items[0]
+        partition_key = item_to_delete['createUserPlace']  # 実際のパーティションキーのフィールド名に置き換えてください
 
-        # 更新データを辞書に変換（未設定のフィールドを除外）
-        update_data = item.dict(exclude_unset=True)
-        update_data["DateUpdated"] = datetime.utcnow()  # 更新日時を追加
+        # アイテムを削除
+        lost_items_container.delete_item(item=item_to_delete['id'], partition_key=partition_key)
+        logger.info(f"Deleted lost item with ID: {id}")
 
-        # 更新されたフィールドのみを反映
-        for key, value in update_data.items():
-            existing_item[key] = value
-
-        # JSONシリアライズ可能な形式に変換
-        existing_item_encoded = jsonable_encoder(existing_item)
-
-        # Cosmos DB に更新されたアイテムを保存
-        lost_items_container.replace_item(item=existing_item, body=existing_item_encoded)
-        logger.info(f"Updated lost item with ID: {item_id}")
-
-        # Pydanticモデルに変換
-        updated_item = LostItem(**existing_item)
-
-        return updated_item
+        # Pydanticモデルに変換して返す
+        deleted_item = LostItem(**item_to_delete)
+        return deleted_item
 
     except Exception as e:
-        logger.error(f"Failed to update lost item: {e}")
-        raise HTTPException(status_code=500, detail=f"アイテムの更新に失敗しました: {str(e)}")
+        logger.error(f"Failed to delete lost item: {e}")
+        raise HTTPException(status_code=500, detail=f"アイテムの削除に失敗しました: {str(e)}")
+
+@app.post("/imagescan")
+async def scan_image(image: UploadFile = File(...)):
+    """
+    画像をアップロードし、処理を行うエンドポイント
+    :param image: アップロードされた画像ファイル
+    :return: 処理結果
+    """    
+    try:
+        result = chat_service.process_image(image)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"画像の処理に失敗しました: {str(e)}")
+
+@app.post("/upload-image")
+async def upload_image(image: UploadFile = File(...)):
+    """
+    画像をAzure Blob Storageにアップロードするエンドポイント
+    :param image: アップロードされた画像ファイル
+    :return: アップロードした画像のURL
+    """
+    try:
+        # DefaultAzureCredentialを使ったBlobServiceClientの初期化
+        credential = DefaultAzureCredential()
+        blob_service_client = BlobServiceClient(account_url=BLOB_ACCOUNT_URL, credential=credential)
+        # Blobのクライアントを作成
+        blob_client = blob_service_client.get_blob_client(container=BLOB_CONTAINER_NAME, blob=image.filename)
+        
+        # 画像をアップロード
+        blob_client.upload_blob(image.file.read(), overwrite=True)
+        
+        # アップロードした画像のURLを生成
+        image_url = f"{BLOB_ACCOUNT_URL}/{BLOB_CONTAINER_NAME}/{image.filename}"
+        
+        return {"imageUrl": image_url}
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"画像のアップロードに失敗しました: {str(e)}")
